@@ -44,7 +44,7 @@ def pairwise_correspondences(images, ratio = 0.6):
             if i == j:
                 pw_correspondences[i][j] = None
             else:
-                pw_correspondences[i][j] = find_sift_correspondences(kps[i], des[i], kp[j], des[j], ratio)
+                pw_correspondences[i][j] = find_sift_correspondences(kps[i], dess[i], kps[j], dess[j], ratio)
 
     return kps, dess, pw_correspondences
 
@@ -91,6 +91,8 @@ def ransac(correspondences, num_iterations, num_sampled_points, threshold):
     best_inliers = []
     best_homography = None
     best_outliers = []
+    if len(correspondences) < num_sampled_points:
+        return None, [], []
     for i in range(num_iterations):
         sampled_correspondences = random.sample(correspondences, num_sampled_points)
         homography = compute_homography(sampled_correspondences)
@@ -113,15 +115,8 @@ def pairwise_ransac(pw_correspondences, num_iterations = 50, num_sampled_points 
             if (len(pw_inliers[i][j]) > alpha + beta * len(pw_correspondences[i][j])):
                 matches.append((i, j))
 
-    best_matches = np.zeros(pw_correspondences.shape[0])
-    for match in matches:
-        i, j = match
-        if len(pw_inliers[i][j]) > len(pw_inliers[i][best_matches]):
-            best_matches[i] = j
 
-
-
-    return pw_homographies, pw_inliers, pw_outliers, matches, best_matches
+    return pw_homographies, pw_inliers, pw_outliers, matches
 
 
 def bundle_adjust(pw_inliers, matches, max_iter = 100):
@@ -225,7 +220,7 @@ def bundle_adjust(pw_inliers, matches, max_iter = 100):
                                   ri1 - (ri3*xk)/fi])
 
                 drj2l = np.array([(fj*ri2*xk)/fi - (fj*ri1*yk)/fi, \
-                                  0, \    
+                                  0, \
                                   ri2 - (ri3*yk)/fi]) 
                 
                 drj3l = np.array([(fj*ri3*xk)/fi - fj*ri1, \
@@ -235,10 +230,10 @@ def bundle_adjust(pw_inliers, matches, max_iter = 100):
                 residual1 = point1 - np.matmul(Ki, np.matmul(Ri, np.matmul(Rj.T, np.matmul(np.linalg.inv(Kj), np.append(point2, 1)))))[:-1]
                 residual2 = point2 - np.matmul(Kj, np.matmul(Rj, np.matmul(Ri.T, np.matmul(np.linalg.inv(Ki), np.append(point1, 1)))))[:-1]
 
-                dik = np.hstack((dfik, dri1k, dri2k, dri3k))
-                djk = np.hstack((dfjk, drj1k, drj2k, drj3k))
-                dil = np.hstack((dfil, dri1l, dri2l, dri3l))
-                djl = np.hstack((dfjl, drj1l, drj2l, drj3l))
+                dik = np.hstack((dfik.reshape([2,1]), dri1k.reshape([2,1]), dri2k.reshape([2,1]), dri2k.reshape([2,1])))
+                djk = np.hstack((dfjk.reshape([2,1]), drj1k.reshape([2,1]), drj2k.reshape([2,1]), drj2k.reshape([2,1])))
+                dil = np.hstack((dfil.reshape([2,1]), dri1l.reshape([2,1]), dri2l.reshape([2,1]), dri2l.reshape([2,1])))
+                djl = np.hstack((dfjl.reshape([2,1]), drj1l.reshape([2,1]), drj2l.reshape([2,1]), drj2l.reshape([2,1])))
 
                 JTJ[4*i:4*i+4, 4*j:4*j+4] += np.matmul(dik.T, djk)
                 JTJ[4*j:4*j+4, 4*i:4*i+4] += np.matmul(djl.T, dil)
