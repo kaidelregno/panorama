@@ -123,21 +123,158 @@ def pairwise_ransac(pw_correspondences, num_iterations = 50, num_sampled_points 
 
     return pw_homographies, pw_inliers, pw_outliers, matches, best_matches
 
-def compute_reprojection_residual(params1, params2, )
 
-def bundle_adjust(pw_inliers, matches, best_matches, max_iter = 100):
+def bundle_adjust(pw_inliers, matches, max_iter = 100):
     #we assume that the camera rotates about its optical center.
     #we parameterize the homography by focal length and a rotation matrix
     #K = [[f, 0, 0], [0, f, 0], [0, 0, 1]]
     #R = [[0, -r3, r2], [r3, 0, -r1], [-r2, r1, 0]]
 
-    params = np.zeros(4*pw_inliers.shape[0])
+    params = np.ones(4*pw_inliers.shape[0])
+    trust = 0.1
+    Cinv = np.zeros((4*pw_inliers.shape[0], 4*pw_inliers.shape[0]))
+    error = np.inf
+    #initialize parameters
+    for i in range(pw_inliers.shape[0]):
+        Cinv[4*i:4*i+4, 4*i:4*i+4] = np.diag([256/(np.pi**2), 256/(np.pi**2), 256/(np.pi**2), 100])
+
+
+    #levenberg-marquardt loop
     for step in range(max_iter):
         JTJ = np.zeros((4*pw_inliers.shape[0], 4*pw_inliers.shape[0]))
         JTr = np.zeros(4*pw_inliers.shape[0])
+
+        error_prev = error
+        error = 0
         for match in matches:
             i,j = match
+
+            fi = params[4*i]
+            fj = params[4*j]
+            ri1 = params[4*i+1]
+            ri2 = params[4*i+2]
+            ri3 = params[4*i+3]
+            rj1 = params[4*j+1]
+            rj2 = params[4*j+2]
+            rj3 = params[4*j+3]
+
+            Ki = np.array([[fi, 0, 0], [0, fi, 0], [0, 0, 1]])
+            Kj = np.array([[fj, 0, 0], [0, fj, 0], [0, 0, 1]])
+            Ri = np.array([[0, -ri3, ri2], [ri3, 0, -ri1], [-ri2, ri1, 0]])
+            Rj = np.array([[0, -rj3, rj2], [rj3, 0, -rj1], [-rj2, rj1, 0]])
+
             for correspondence in pw_inliers[i][j]:
                 point1, point2 = correspondence
+                xk, yk = point1
+                xl, yl = point2
+
+                dfik = np.array([xl*(ri2*rj2 +ri3*rj3)/fj - ri3*rj1 - ri2*rj1*yl/fj,\
+                                 yl*(ri1*rj1 + ri3*rj3)/fj - ri3*rj2 - ri1*rj2*xl/fj,\
+                                 0])
+
+                dfjk = np.array([(fi*ri2*rj1*yl)/(fj**2) - (xl*(fi*ri2*rj2 + fi*ri3*rj3))/(fj**2), \
+                                 (fi*ri1*rj2*xl)/(fj**2) - (yl*(fi*ri1*rj1 + fi*ri3*rj3))/(fj**2), \
+                                 (ri1*rj3*xl)/(fj**2) + (ri2*rj3*yl)/(fj**2)])\
+                
+                dri1k = np.array([0, \
+                                  (fi*rj1*yl)/fj - (fi*rj2*xl)/fj,\
+                                  rj1 - (rj3*xl)/fj])
+
+                dri2k = np.array([(fi*rj2*xl)/fj - (fi*rj1*yl)/fj, \
+                                  0, \
+                                  rj2 - (rj3*yl)/fj])
+
+                dri3k = np.array([(fi*rj3*xl)/fj - fi*rj1, \
+                                  (fi*rj3*yl)/fj - fi*rj2, \
+                                  0])
+
+                drj1k = np.array([- fi*ri3 - (fi*ri2*yl)/fj, \
+                                  (fi*ri1*yl)/fj, \
+                                  ri1])
+
+                drj2k = np.array([(fi*ri2*xl)/fj, \
+                                  - fi*ri3 - (fi*ri1*xl)/fj, \
+                                  ri2])
+
+                drj3k = np.array([(fi*ri3*xl)/fj, \
+                                  (fi*ri3*yl)/fj, \
+                                  - (ri1*xl)/fj - (ri2*yl)/fj])
+
+                dfil = np.array([(fj*ri1*rj2*yk)/(fi**2) - (xk*(fj*ri2*rj2 + fj*ri3*rj3))/(fi**2), \
+                                 (fj*ri2*rj1*xk)/(fi**2) - (yk*(fj*ri1*rj1 + fj*ri3*rj3))/(fi**2), \
+                                 (ri3*rj1*xk)/(fi**2) + (ri3*rj2*yk)/(fi**2)])
+
+                dfjl = np.array([(xk*(ri2*rj2 + ri3*rj3))/fi - ri1*rj3 - (ri1*rj2*yk)/fi, \
+                                 (yk*(ri1*rj1 + ri3*rj3))/fi - ri2*rj3 - (ri2*rj1*xk)/fi, \
+                                 0])
+
+                dri1l = np.array([- fj*rj3 - (fj*rj2*yk)/fi, \
+                                 (fj*rj1*yk)/fi, \
+                                 rj1])
+                                
+                dri2l = np.array([(fj*rj2*xk)/fi, \
+                                  - fj*rj3 - (fj*rj1*xk)/fi, \
+                                  rj2])
+
+                dri3l = np.array([(fj*rj3*xk)/fi, \
+                                  (fj*rj3*yk)/fi, \
+                                  - (rj1*xk)/fi - (rj2*yk)/fi])
+
+                drj1l = np.array([0, \
+                                  (fj*ri1*yk)/fi - (fj*ri2*xk)/fi, \
+                                  ri1 - (ri3*xk)/fi])
+
+                drj2l = np.array([(fj*ri2*xk)/fi - (fj*ri1*yk)/fi, \
+                                  0, \    
+                                  ri2 - (ri3*yk)/fi]) 
+                
+                drj3l = np.array([(fj*ri3*xk)/fi - fj*ri1, \
+                                  (fj*ri3*yk)/fi - fj*ri2, \
+                                  0])
+
+                residual1 = point1 - np.matmul(Ki, np.matmul(Ri, np.matmul(Rj.T, np.matmul(np.linalg.inv(Kj), np.append(point2, 1)))))[:-1]
+                residual2 = point2 - np.matmul(Kj, np.matmul(Rj, np.matmul(Ri.T, np.matmul(np.linalg.inv(Ki), np.append(point1, 1)))))[:-1]
+
+                dik = np.hstack((dfik, dri1k, dri2k, dri3k))
+                djk = np.hstack((dfjk, drj1k, drj2k, drj3k))
+                dil = np.hstack((dfil, dri1l, dri2l, dri3l))
+                djl = np.hstack((dfjl, drj1l, drj2l, drj3l))
+
+                JTJ[4*i:4*i+4, 4*j:4*j+4] += np.matmul(dik.T, djk)
+                JTJ[4*j:4*j+4, 4*i:4*i+4] += np.matmul(djl.T, dil)
+
+                JTr[4*i:4*i+4] += np.matmul(dik.T, residual1)
+                JTr[4*j:4*j+4] += np.matmul(djl.T, residual2)
+
+                error += np.sum(residual1**2) + np.sum(residual2**2)
+    
+        params_prev = params
+        params = np.linalg.solve(JTJ + trust * Cinv, JTr)
+        for i in range(pw_inliers.shape[0]):
+            fmean += params[4*i]
+        fmean /= pw_inliers.shape[0]
+
+        for i in range(pw_inliers.shape[0]):
+            Cinv[4*i:4*i+4, 4*i:4*i+4] = np.diag([256/(np.pi**2), 256/(np.pi**2), 256/(np.pi**2), 100/(fmean **2)])
+
+        if error < error_prev:
+            trust = 0.8 * trust
+        else:
+            trust = 2 * trust
+            params = params_prev
+
+        if error - error_prev < 0.01:
+            break
+
+    return params
+
+        
+        
+
+
+                                
+                
+
+                
                 
             
