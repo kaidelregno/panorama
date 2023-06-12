@@ -4,6 +4,9 @@ import matplotlib.pyplot as plt
 import imageio
 import os
 import random
+import torch.nn.functional as F
+import torch
+import scipy.optimize as opt
 
 def load_images(images_folder_path):
     images = []
@@ -26,7 +29,7 @@ def find_sift_correspondences(kp1, des1, kp2, des2, ratio):
         distances = np.sqrt(np.sum((des2 - des1[i])**2, axis=1))
         sort_order = np.argsort(distances)
         if distances[sort_order[0]] < ratio * distances[sort_order[1]]:
-            correspondences.append((kp.pt, kp2[sort_order[0]].pt))
+            correspondences.append(np.array([kp.pt, kp2[sort_order[0]].pt]))
 
     return correspondences
 
@@ -118,6 +121,103 @@ def pairwise_ransac(pw_correspondences, num_iterations = 50, num_sampled_points 
 
     return pw_homographies, pw_inliers, pw_outliers, matches
 
+def bundle_adjust_torch(pw_inliers, matches, max_iter = 100):
+
+    params = torch.ones(4*pw_inliers.shape[0], requires_grad=True)
+    trust = 0.1
+    Cinv = torch.zeros((4*pw_inliers.shape[0], 4*pw_inliers.shape[0]))
+    error = np.inf
+    for i in range(pw_inliers.shape[0]):
+        Cinv[4*i:4*i+4, 4*i:4*i+4] = torch.diag(torch.tensor([100, 256/(np.pi**2), 256/(np.pi**2), 256/(np.pi**2)]))
+    
+    for step in range(max_iter):
+        JTJ = torch.zeros((4*pw_inliers.shape[0], 4*pw_inliers.shape[0]))
+        JTr = torch.zeros(4*pw_inliers.shape[0])
+
+        error_prev = error
+        error = 0
+        fmean = 0
+        num_correspondences = 0
+        params_prev = params.clone()
+
+        for match in matches:
+            i,j = match
+
+            Ki = torch.tensor([[params[4*i], 0, 0], [0, params[4*i], 0], [0, 0, 1]], requires_grad=True)
+            Kj = torch.tensor([[params[4*j], 0, 0], [0, params[4*j], 0], [0, 0, 1]], requires_grad=True)
+            Ri = torch.tensor([[0, -params[4*i+3], params[4*i+2]], [params[4*i+3], 0, -params[4*i+1]], [-params[4*i+2], params[4*i+1], 0]], requires_grad=True)
+            Rj = torch.tensor([[0, -params[4*j+3], params[4*j+2]], [params[4*j+3], 0, -params[4*j+1]], [-params[4*j+2], params[4*j+1], 0]], requires_grad=True)
+            for correspondence in pw_inliers[i][j]:
+                point1, point2 = correspondence
+                point1 = torch.tensor(point1, requires_grad=True)
+                point2 = torch.tensor(point2, requires_grad=True)
+
+                pijk = torch.matmul(Ki, torch.matmul(Ri, torch.matmul(Rj.T, torch.matmul(torch.inverse(Kj), torch.cat((point2, torch.tensor([1])))))))
+                pijl = torch.matmul(Kj, torch.matmul(Rj, torch.matmul(Ri.T, torch.matmul(torch.inverse(Ki), torch.cat((point1, torch.tensor([1])))))))
+
+                pijk = (pijk[:-1] / pijk[-1]).reshape([2,1])
+                pijl = (pijl[:-1] / pijl[-1]).reshape([2,1])
+
+                pijk.backward()
+                dik = torch.cat((params[4*i].grad, params[4*i+1].grad, params[4*i+2].grad, params[4*i+3].grad), dim = 1)
+                djk = torch.cat((params[4*j].grad, params[4*j+1].grad, params[4*j+2].grad, params[4*j+3].grad), dim = 1)
+
+                params.grad.zero_()
+                pijk.grad.zero_()
+                pijl.grad.zero_()
+                Ki.grad.zero_()
+                Kj.grad.zero_()
+                Ri.grad.zero_()
+                Rj.grad.zero_()
+
+                pijl.backward()
+                dil = torch.cat((params[4*i].grad, params[4*i+1].grad, params[4*i+2].grad, params[4*i+3].grad), dim = 1)
+                djl = torch.cat((params[4*j].grad, params[4*j+1].grad, params[4*j+2].grad, params[4*j+3].grad), dim = 1)
+
+                params.grad.zero_()
+                pijk.grad.zero_()
+                pijl.grad.zero_()
+                Ki.grad.zero_()
+                Kj.grad.zero_()
+                Ri.grad.zero_()
+                Rj.grad.zero_()
+
+                JTJ[4*i:4*i+4, 4*i:4*i+4] += torch.matmul(dik.T, djk)
+                JTJ[4*i:4*i+4, 4*j:4*j+4] += torch.matmul(dil.T, djl)
+
+                JTr[4*i:4*i+4] += torch.matmul(-dik.T, pijk)
+                JTr[4*j:4*j+4] += torch.matmul(-dil.T, pijl)
+
+                error += torch.sum((pijk - point1)**2) + torch.sum((pijl - point2)**2)
+                num_correspondences += 2
+
+        error = error / num_correspondences
+        if error < error_prev:
+            trust = 0.8 * trust
+            params = torch.linalg.solve(JTJ + trust * Cinv, JTr)
+        else:
+            trust = 2 * trust
+            params = params_prev
+
+        if abs(error - error_prev) < 1e-5:
+            print("Converged at step ", step)
+            break
+
+        
+        for i in range(pw_inliers.shape[0]):
+            fmean += params[4*i]
+        fmean /= pw_inliers.shape[0]
+
+        for i in range(pw_inliers.shape[0]):
+            Cinv[4*i:4*i+4, 4*i:4*i+4] = np.diag([100/(fmean **2), 256/(np.pi**2), 256/(np.pi**2), 256/(np.pi**2)])
+
+        print("Step %d: Average reprojection error = %f" % (step, error / num_correspondences))
+
+    return params
+
+
+
+
 
 def bundle_adjust(pw_inliers, matches, max_iter = 100):
     #we assume that the camera rotates about its optical center.
@@ -129,9 +229,12 @@ def bundle_adjust(pw_inliers, matches, max_iter = 100):
     trust = 0.1
     Cinv = np.zeros((4*pw_inliers.shape[0], 4*pw_inliers.shape[0]))
     error = np.inf
+
     #initialize parameters
     for i in range(pw_inliers.shape[0]):
-        Cinv[4*i:4*i+4, 4*i:4*i+4] = np.diag([256/(np.pi**2), 256/(np.pi**2), 256/(np.pi**2), 100])
+        Cinv[4*i:4*i+4, 4*i:4*i+4] = np.diag([100, 256/(np.pi**2), 256/(np.pi**2), 256/(np.pi**2)])
+    
+
 
 
     #levenberg-marquardt loop
@@ -141,6 +244,9 @@ def bundle_adjust(pw_inliers, matches, max_iter = 100):
 
         error_prev = error
         error = 0
+        fmean = 0
+        num_correspondences = 0
+        dfik_err = 0
         for match in matches:
             i,j = match
 
@@ -155,84 +261,52 @@ def bundle_adjust(pw_inliers, matches, max_iter = 100):
 
             Ki = np.array([[fi, 0, 0], [0, fi, 0], [0, 0, 1]])
             Kj = np.array([[fj, 0, 0], [0, fj, 0], [0, 0, 1]])
-            Ri = np.array([[0, -ri3, ri2], [ri3, 0, -ri1], [-ri2, ri1, 0]])
+            Ri = np.array([[0, -ri3, ri2], [ri3, 0, -ri1], [-ri2, ri1, 0]])           
             Rj = np.array([[0, -rj3, rj2], [rj3, 0, -rj1], [-rj2, rj1, 0]])
+
+            thetai = np.sqrt(ri1**2 + ri2**2 + ri3**2)
+            thetaj = np.sqrt(rj1**2 + rj2**2 + rj3**2)
+
+            Ri = np.eye(3) + np.sin(thetai)/thetai * Ri + (1-np.cos(thetai))/(thetai**2) * np.matmul(Ri, Ri)
+            Rj = np.eye(3) + np.sin(thetaj)/thetaj * Rj + (1-np.cos(thetaj))/(thetaj**2) * np.matmul(Rj, Rj)
 
             for correspondence in pw_inliers[i][j]:
                 point1, point2 = correspondence
                 xk, yk = point1
                 xl, yl = point2
 
-                dfik = np.array([-(ri3*rj1 - (xl*(ri2*rj2 + ri3*rj3))/fj + (ri2*rj1*yl)/fj)/(ri1*rj1 + ri2*rj2 - (ri1*rj3*xl)/fj - (ri2*rj3*yl)/fj), \
-                                -(ri3*rj2 - (yl*(ri1*rj1 + ri3*rj3))/fj + (ri1*rj2*xl)/fj)/(ri1*rj1 + ri2*rj2 - (ri1*rj3*xl)/fj - (ri2*rj3*yl)/fj)])
-
-                dfjk = np.array([(((ri1*rj3*xl)/fj^2 + (ri2*rj3*yl)/fj^2)*(fi*ri3*rj1 - (xl*(fi*ri2*rj2 + fi*ri3*rj3))/fj + (fi*ri2*rj1*yl)/fj))/(ri1*rj1 + ri2*rj2 \
-                                 - (ri1*rj3*xl)/fj - (ri2*rj3*yl)/fj)^2 - ((xl*(fi*ri2*rj2 + fi*ri3*rj3))/fj^2 - (fi*ri2*rj1*yl)/fj^2)/(ri1*rj1 + ri2*rj2 - (ri1*rj3*xl)/fj - (ri2*rj3*yl)/fj), \
-                                (((ri1*rj3*xl)/fj^2 + (ri2*rj3*yl)/fj^2)*(fi*ri3*rj2 - (yl*(fi*ri1*rj1 + fi*ri3*rj3))/fj + (fi*ri1*rj2*xl)/fj))/(ri1*rj1 + ri2*rj2 - (ri1*rj3*xl)/fj - \
-                                 (ri2*rj3*yl)/fj)^2 - ((yl*(fi*ri1*rj1 + fi*ri3*rj3))/fj^2 - (fi*ri1*rj2*xl)/fj^2)/(ri1*rj1 + ri2*rj2 - (ri1*rj3*xl)/fj - (ri2*rj3*yl)/fj)])\
-                
-                dri1k = np.array([((rj1 - (rj3*xl)/fj)*(fi*ri3*rj1 - (xl*(fi*ri2*rj2 + fi*ri3*rj3))/fj + (fi*ri2*rj1*yl)/fj))/(ri1*rj1 + ri2*rj2 - (ri1*rj3*xl)/fj - (ri2*rj3*yl)/fj)^2, \
-                                ((rj1 - (rj3*xl)/fj)*(fi*ri3*rj2 - (yl*(fi*ri1*rj1 + fi*ri3*rj3))/fj + (fi*ri1*rj2*xl)/fj))/(ri1*rj1 + ri2*rj2 - (ri1*rj3*xl)/fj - (ri2*rj3*yl)/fj)^2 - \
-                                     ((fi*rj2*xl)/fj - (fi*rj1*yl)/fj)/(ri1*rj1 + ri2*rj2 - (ri1*rj3*xl)/fj - (ri2*rj3*yl)/fj)])
-
-                dri2k = np.array([((fi*rj2*xl)/fj - (fi*rj1*yl)/fj)/(ri1*rj1 + ri2*rj2 - (ri1*rj3*xl)/fj - (ri2*rj3*yl)/fj) + ((rj2 - (rj3*yl)/fj)*(fi*ri3*rj1 - (xl*(fi*ri2*rj2 + \
-                                 fi*ri3*rj3))/fj + (fi*ri2*rj1*yl)/fj))/(ri1*rj1 + ri2*rj2 - (ri1*rj3*xl)/fj - (ri2*rj3*yl)/fj)^2, \
-                                ((rj2 - (rj3*yl)/fj)*(fi*ri3*rj2 - (yl*(fi*ri1*rj1 + fi*ri3*rj3))/fj + (fi*ri1*rj2*xl)/fj))/(ri1*rj1 + ri2*rj2 - (ri1*rj3*xl)/fj - (ri2*rj3*yl)/fj)^2])
-
-                dri3k = np.array([-(fi*rj1 - (fi*rj3*xl)/fj)/(ri1*rj1 + ri2*rj2 - (ri1*rj3*xl)/fj - (ri2*rj3*yl)/fj), \
-                                -(fi*rj2 - (fi*rj3*yl)/fj)/(ri1*rj1 + ri2*rj2 - (ri1*rj3*xl)/fj - (ri2*rj3*yl)/fj)])
-
-                drj1k = np.array([(ri1*(fi*ri3*rj1 - (xl*(fi*ri2*rj2 + fi*ri3*rj3))/fj + (fi*ri2*rj1*yl)/fj))/(ri1*rj1 + \
-                                 ri2*rj2 - (ri1*rj3*xl)/fj - (ri2*rj3*yl)/fj)^2 - (fi*ri3 + (fi*ri2*yl)/fj)/(ri1*rj1 + ri2*rj2 - (ri1*rj3*xl)/fj - (ri2*rj3*yl)/fj), \
-                                (ri1*(fi*ri3*rj2 - (yl*(fi*ri1*rj1 + fi*ri3*rj3))/fj + (fi*ri1*rj2*xl)/fj))/(ri1*rj1 + ri2*rj2 - (ri1*rj3*xl)/fj - (ri2*rj3*yl)/fj)^2 + \
-                                     (fi*ri1*yl)/(fj*(ri1*rj1 + ri2*rj2 - (ri1*rj3*xl)/fj - (ri2*rj3*yl)/fj))])
-
-                drj2k = np.array([(ri2*(fi*ri3*rj1 - (xl*(fi*ri2*rj2 + fi*ri3*rj3))/fj + (fi*ri2*rj1*yl)/fj))/(ri1*rj1 + ri2*rj2 - (ri1*rj3*xl)/fj - (ri2*rj3*yl)/fj)^2 + \
-                                (fi*ri2*xl)/(fj*(ri1*rj1 + ri2*rj2 - (ri1*rj3*xl)/fj - (ri2*rj3*yl)/fj)), \
-                                (ri2*(fi*ri3*rj2 - (yl*(fi*ri1*rj1 + fi*ri3*rj3))/fj + (fi*ri1*rj2*xl)/fj))/(ri1*rj1 + ri2*rj2 - (ri1*rj3*xl)/fj - (ri2*rj3*yl)/fj)^2 - \
-                                    (fi*ri3 + (fi*ri1*xl)/fj)/(ri1*rj1 + ri2*rj2 - (ri1*rj3*xl)/fj - (ri2*rj3*yl)/fj)])
-
-                drj3k = np.array([(fi*ri3*xl)/(fj*(ri1*rj1 + ri2*rj2 - (ri1*rj3*xl)/fj - (ri2*rj3*yl)/fj)) - (((ri1*xl)/fj + (ri2*yl)/fj)*(fi*ri3*rj1 - \
-                                 (xl*(fi*ri2*rj2 + fi*ri3*rj3))/fj + (fi*ri2*rj1*yl)/fj))/(ri1*rj1 + ri2*rj2 - (ri1*rj3*xl)/fj - (ri2*rj3*yl)/fj)^2, \
-                                (fi*ri3*yl)/(fj*(ri1*rj1 + ri2*rj2 - (ri1*rj3*xl)/fj - (ri2*rj3*yl)/fj)) - (((ri1*xl)/fj + (ri2*yl)/fj)*(fi*ri3*rj2 - \
-                                 (yl*(fi*ri1*rj1 + fi*ri3*rj3))/fj + (fi*ri1*rj2*xl)/fj))/(ri1*rj1 + ri2*rj2 - (ri1*rj3*xl)/fj - (ri2*rj3*yl)/fj)^2])
-
-                dfil = np.array([(((ri3*rj1*xk)/fi^2 + (ri3*rj2*yk)/fi^2)*(fj*ri1*rj3 - (xk*(fj*ri2*rj2 + fj*ri3*rj3))/fi + (fj*ri1*rj2*yk)/fi))/(ri1*rj1 + ri2*rj2 - (ri3*rj1*xk)/fi \
-                                - (ri3*rj2*yk)/fi)^2 - ((xk*(fj*ri2*rj2 + fj*ri3*rj3))/fi^2 - (fj*ri1*rj2*yk)/fi^2)/(ri1*rj1 + ri2*rj2 - (ri3*rj1*xk)/fi - (ri3*rj2*yk)/fi), \
-                                (((ri3*rj1*xk)/fi^2 + (ri3*rj2*yk)/fi^2)*(fj*ri2*rj3 - (yk*(fj*ri1*rj1 + fj*ri3*rj3))/fi + (fj*ri2*rj1*xk)/fi))/(ri1*rj1 + ri2*rj2 - (ri3*rj1*xk)/fi - \
-                                 (ri3*rj2*yk)/fi)^2 - ((yk*(fj*ri1*rj1 + fj*ri3*rj3))/fi^2 - (fj*ri2*rj1*xk)/fi^2)/(ri1*rj1 + ri2*rj2 - (ri3*rj1*xk)/fi - (ri3*rj2*yk)/fi)])
-
-                dfjl = np.array([-(ri1*rj3 - (xk*(ri2*rj2 + ri3*rj3))/fi + (ri1*rj2*yk)/fi)/(ri1*rj1 + ri2*rj2 - (ri3*rj1*xk)/fi - (ri3*rj2*yk)/fi), \
-                                -(ri2*rj3 - (yk*(ri1*rj1 + ri3*rj3))/fi + (ri2*rj1*xk)/fi)/(ri1*rj1 + ri2*rj2 - (ri3*rj1*xk)/fi - (ri3*rj2*yk)/fi)])
-
-                dri1l = np.array([(rj1*(fj*ri1*rj3 - (xk*(fj*ri2*rj2 + fj*ri3*rj3))/fi + (fj*ri1*rj2*yk)/fi))/(ri1*rj1 + ri2*rj2 - (ri3*rj1*xk)/fi - \
-                                (ri3*rj2*yk)/fi)^2 - (fj*rj3 + (fj*rj2*yk)/fi)/(ri1*rj1 + ri2*rj2 - (ri3*rj1*xk)/fi - (ri3*rj2*yk)/fi), \
-                                (rj1*(fj*ri2*rj3 - (yk*(fj*ri1*rj1 + fj*ri3*rj3))/fi + (fj*ri2*rj1*xk)/fi))/(ri1*rj1 + ri2*rj2 - (ri3*rj1*xk)/fi - \
-                                    (ri3*rj2*yk)/fi)^2 +  (fj*rj1*yk)/(fi*(ri1*rj1 + ri2*rj2 - (ri3*rj1*xk)/fi - (ri3*rj2*yk)/fi))])
-                                
-                dri2l = np.array([(rj2*(fj*ri1*rj3 - (xk*(fj*ri2*rj2 + fj*ri3*rj3))/fi + (fj*ri1*rj2*yk)/fi))/(ri1*rj1 + ri2*rj2 - (ri3*rj1*xk)/fi - \
-                                 (ri3*rj2*yk)/fi)^2 + (fj*rj2*xk)/(fi*(ri1*rj1 + ri2*rj2 - (ri3*rj1*xk)/fi - (ri3*rj2*yk)/fi)), \
-                                (rj2*(fj*ri2*rj3 - (yk*(fj*ri1*rj1 + fj*ri3*rj3))/fi + (fj*ri2*rj1*xk)/fi))/(ri1*rj1 + ri2*rj2 - (ri3*rj1*xk)/fi - \
-                                    (ri3*rj2*yk)/fi)^2 - (fj*rj3 + (fj*rj1*xk)/fi)/(ri1*rj1 + ri2*rj2 - (ri3*rj1*xk)/fi - (ri3*rj2*yk)/fi)])
-
-                dri3l = np.array([(fj*rj3*xk)/(fi*(ri1*rj1 + ri2*rj2 - (ri3*rj1*xk)/fi - (ri3*rj2*yk)/fi)) - (((rj1*xk)/fi + (rj2*yk)/fi)*(fj*ri1*rj3 - \
-                                (xk*(fj*ri2*rj2 + fj*ri3*rj3))/fi + (fj*ri1*rj2*yk)/fi))/(ri1*rj1 + ri2*rj2 - (ri3*rj1*xk)/fi - (ri3*rj2*yk)/fi)^2, \
-                                (fj*rj3*yk)/(fi*(ri1*rj1 + ri2*rj2 - (ri3*rj1*xk)/fi - (ri3*rj2*yk)/fi)) - (((rj1*xk)/fi + (rj2*yk)/fi)*(fj*ri2*rj3 - \
-                                    (yk*(fj*ri1*rj1 + fj*ri3*rj3))/fi + (fj*ri2*rj1*xk)/fi))/(ri1*rj1 + ri2*rj2 - (ri3*rj1*xk)/fi - (ri3*rj2*yk)/fi)^2])
-
-                drj1l = np.array([((ri1 - (ri3*xk)/fi)*(fj*ri1*rj3 - (xk*(fj*ri2*rj2 + fj*ri3*rj3))/fi + (fj*ri1*rj2*yk)/fi))/(ri1*rj1 + ri2*rj2 - (ri3*rj1*xk)/fi - (ri3*rj2*yk)/fi)^2, \
-                                ((ri1 - (ri3*xk)/fi)*(fj*ri2*rj3 - (yk*(fj*ri1*rj1 + fj*ri3*rj3))/fi + (fj*ri2*rj1*xk)/fi))/(ri1*rj1 + ri2*rj2 - (ri3*rj1*xk)/fi - (ri3*rj2*yk)/fi)^2 - \
-                                     ((fj*ri2*xk)/fi - (fj*ri1*yk)/fi)/(ri1*rj1 + ri2*rj2 - (ri3*rj1*xk)/fi - (ri3*rj2*yk)/fi)])
-
-                drj2l = np.array([((fj*ri2*xk)/fi - (fj*ri1*yk)/fi)/(ri1*rj1 + ri2*rj2 - (ri3*rj1*xk)/fi - (ri3*rj2*yk)/fi) + ((ri2 - (ri3*yk)/fi)*(fj*ri1*rj3 - \
-                                (xk*(fj*ri2*rj2 + fj*ri3*rj3))/fi + (fj*ri1*rj2*yk)/fi))/(ri1*rj1 + ri2*rj2 - (ri3*rj1*xk)/fi - (ri3*rj2*yk)/fi)^2, \
-                                ((ri2 - (ri3*yk)/fi)*(fj*ri2*rj3 - (yk*(fj*ri1*rj1 + fj*ri3*rj3))/fi + (fj*ri2*rj1*xk)/fi))/(ri1*rj1 + ri2*rj2 - (ri3*rj1*xk)/fi - (ri3*rj2*yk)/fi)^2]) 
-                
-                drj3l = np.array([-(fj*ri1 - (fj*ri3*xk)/fi)/(ri1*rj1 + ri2*rj2 - (ri3*rj1*xk)/fi - (ri3*rj2*yk)/fi), \
-                                -(fj*ri2 - (fj*ri3*yk)/fi)/(ri1*rj1 + ri2*rj2 - (ri3*rj1*xk)/fi - (ri3*rj2*yk)/fi)])
-
                 pijk = np.matmul(Ki, np.matmul(Ri, np.matmul(Rj.T, np.matmul(np.linalg.inv(Kj), np.append(point2, 1)))))
                 pijl = np.matmul(Kj, np.matmul(Rj, np.matmul(Ri.T, np.matmul(np.linalg.inv(Ki), np.append(point1, 1)))))
+
+                dhomok = np.array([[1/pijk[-1], 0, -pijk[0]/(pijk[-1]**2)], [0, 1/pijk[-1], -pijk[1]/(pijk[-1]**2)]])
+                dhomol = np.array([[1/pijl[-1], 0, -pijl[0]/(pijl[-1]**2)], [0, 1/pijl[-1], -pijl[1]/(pijl[-1]**2)]])
+
+                dfik = np.matmul(dhomok, np.matmul(np.array([[1, 0, 0], [0, 1, 0], [0, 0, 0]]), np.matmul(Ri, np.matmul(Rj.T, np.matmul(np.linalg.inv(Kj), np.append(point2, 1))))))
+                dfjk = np.matmul(dhomok, np.matmul(Ki, np.matmul(Ri, np.matmul(Rj.T, np.matmul(np.array([[-1/(fj**2), 0, 0], [0, -1/fj**2, 0], [0, 0, 0]]), np.append(point2, 1))))))
+                dfjl = np.matmul(dhomol, np.matmul(np.array([[1, 0, 0], [0, 1, 0], [0, 0, 0]]), np.matmul(Rj, np.matmul(Ri.T, np.matmul(np.linalg.inv(Ki), np.append(point1, 1))))))
+                dfil = np.matmul(dhomol, np.matmul(Kj, np.matmul(Rj, np.matmul(Ri.T, np.matmul(np.array([[-1/(fi**2), 0, 0], [0, -1/fi**2, 0], [0, 0, 0]]), np.append(point1, 1))))))
+
+                dri1k = np.matmul(dhomok, np.matmul(Ki, np.matmul(np.matmul(Ri, np.array([[0,0,0],[0,0,-1],[0,1,0]])), np.matmul(Rj.T, np.matmul(np.linalg.inv(Kj), np.append(point2, 1))))))
+                dri2k = np.matmul(dhomok, np.matmul(Ki, np.matmul(np.matmul(Ri, np.array([[0,0,1],[0,0,0],[-1,0,0]])), np.matmul(Rj.T, np.matmul(np.linalg.inv(Kj), np.append(point2, 1))))))
+                dri3k = np.matmul(dhomok, np.matmul(Ki, np.matmul(np.matmul(Ri, np.array([[0,-1,0],[1,0,0],[0,0,0]])), np.matmul(Rj.T, np.matmul(np.linalg.inv(Kj), np.append(point2, 1))))))
+                drj1k = np.matmul(dhomok, np.matmul(Ki, np.matmul(Ri, np.matmul(np.matmul(Rj.T, np.array([[0,0,0],[0,0,1],[0,-1,0]])), np.matmul(np.linalg.inv(Kj), np.append(point2, 1))))))
+                drj2k = np.matmul(dhomok, np.matmul(Ki, np.matmul(Ri, np.matmul(np.matmul(Rj.T, np.array([[0,0,-1],[0,0,0],[1,0,0]])), np.matmul(np.linalg.inv(Kj), np.append(point2, 1))))))
+                drj3k = np.matmul(dhomok, np.matmul(Ki, np.matmul(Ri, np.matmul(np.matmul(Rj.T, np.array([[0,1,0],[-1,0,0],[0,0,0]])), np.matmul(np.linalg.inv(Kj), np.append(point2, 1))))))
+
+                dri1l = np.matmul(dhomol, np.matmul(Kj, np.matmul(np.matmul(Rj, np.array([[0,0,0],[0,0,-1],[0,1,0]])), np.matmul(Ri.T, np.matmul(np.linalg.inv(Ki), np.append(point1, 1))))))
+                dri2l = np.matmul(dhomol, np.matmul(Kj, np.matmul(np.matmul(Rj, np.array([[0,0,1],[0,0,0],[-1,0,0]])), np.matmul(Ri.T, np.matmul(np.linalg.inv(Ki), np.append(point1, 1))))))
+                dri3l = np.matmul(dhomol, np.matmul(Kj, np.matmul(np.matmul(Rj, np.array([[0,-1,0],[1,0,0],[0,0,0]])), np.matmul(Ri.T, np.matmul(np.linalg.inv(Ki), np.append(point1, 1))))))
+                drj1l = np.matmul(dhomol, np.matmul(Kj, np.matmul(Rj, np.matmul(np.matmul(Ri.T, np.array([[0,0,0],[0,0,1],[0,-1,0]])), np.matmul(np.linalg.inv(Ki), np.append(point1, 1))))))
+                drj2l = np.matmul(dhomol, np.matmul(Kj, np.matmul(Rj, np.matmul(np.matmul(Ri.T, np.array([[0,0,-1],[0,0,0],[1,0,0]])), np.matmul(np.linalg.inv(Ki), np.append(point1, 1))))))
+                drj3l = np.matmul(dhomol, np.matmul(Kj, np.matmul(Rj, np.matmul(np.matmul(Ri.T, np.array([[0,1,0],[-1,0,0],[0,0,0]])), np.matmul(np.linalg.inv(Ki), np.append(point1, 1))))))
+
+                pijk_num = np.matmul(Ki, np.matmul(np.array([[0,0,0], [0, 0, 1.01], [0, 1.01, 0]])*Ri, np.matmul(Rj.T, np.matmul(np.linalg.inv(Kj), np.append(point2, 1)))))
+                pijk_num = pijk_num[:-1] / pijk_num[-1]
+                dri1k_num = (pijk_num - pijk[:-1] / pijk[-1]) / 0.01
+
+                dfik_err += np.sum(dri1k-dri1k_num[:-1])
+                # print("dfik: ", dfik)
+                # print("dfik_num: ", dfik_num)
 
                 residual1 = point1 - pijk[:-1] / pijk[-1]
                 residual2 = point2 - pijl[:-1] / pijl[-1]
@@ -247,10 +321,11 @@ def bundle_adjust(pw_inliers, matches, max_iter = 100):
                 JTJ[4*i:4*i+4, 4*j:4*j+4] += np.matmul(dik.T, djk)
                 JTJ[4*j:4*j+4, 4*i:4*i+4] += np.matmul(djl.T, dil)
 
-                JTr[4*i:4*i+4] += np.matmul(dik.T, residual1)
-                JTr[4*j:4*j+4] += np.matmul(djl.T, residual2)
+                JTr[4*i:4*i+4] += np.matmul(-dik.T, residual1)
+                JTr[4*j:4*j+4] += np.matmul(-djl.T, residual2)
 
                 error += np.sum(residual1**2) + np.sum(residual2**2)
+                num_correspondences += 2
     
         params_prev = params
         params = np.linalg.solve(JTJ + trust * Cinv, JTr)
@@ -259,7 +334,7 @@ def bundle_adjust(pw_inliers, matches, max_iter = 100):
         fmean /= pw_inliers.shape[0]
 
         for i in range(pw_inliers.shape[0]):
-            Cinv[4*i:4*i+4, 4*i:4*i+4] = np.diag([256/(np.pi**2), 256/(np.pi**2), 256/(np.pi**2), 100/(fmean **2)])
+            Cinv[4*i:4*i+4, 4*i:4*i+4] = np.diag([100/(fmean **2), 256/(np.pi**2), 256/(np.pi**2), 256/(np.pi**2)])
 
         if error < error_prev:
             trust = 0.8 * trust
@@ -267,10 +342,63 @@ def bundle_adjust(pw_inliers, matches, max_iter = 100):
             trust = 2 * trust
             params = params_prev
 
-        if error - error_prev < 0.01:
+        if abs(error - error_prev) < 0.01:
+            print("Converged at step: ", step)
             break
 
+        print("Step %d: Average reprojection error = %f" % (step, error / num_correspondences))
+        print("step %d: dfik_err = %f" % (step, dfik_err))
+
     return params
+
+import jaxopt
+
+def jax_residual(params, pw_inliers, matches):
+    for match in matches:
+        i,j = match
+
+        fi = params[4*i]
+        fj = params[4*j]
+        ri1 = params[4*i+1]
+        ri2 = params[4*i+2]
+        ri3 = params[4*i+3]
+        rj1 = params[4*j+1]
+        rj2 = params[4*j+2]
+        rj3 = params[4*j+3]
+
+        Ki = np.array([[fi, 0, 0], [0, fi, 0], [0, 0, 1]])
+        Kj = np.array([[fj, 0, 0], [0, fj, 0], [0, 0, 1]])
+        Ri = np.array([[0, -ri3, ri2], [ri3, 0, -ri1], [-ri2, ri1, 0]])           
+        Rj = np.array([[0, -rj3, rj2], [rj3, 0, -rj1], [-rj2, rj1, 0]])
+
+        thetai = np.sqrt(ri1**2 + ri2**2 + ri3**2)
+        thetaj = np.sqrt(rj1**2 + rj2**2 + rj3**2)
+
+        Ri = np.eye(3) + np.sin(thetai)/thetai * Ri + (1-np.cos(thetai))/(thetai**2) * np.matmul(Ri, Ri)
+        Rj = np.eye(3) + np.sin(thetaj)/thetaj * Rj + (1-np.cos(thetaj))/(thetaj**2) * np.matmul(Rj, Rj)
+
+        for correspondence in pw_inliers[i][j]:
+            point1, point2 = correspondence
+
+            pijk = np.matmul(Ki, np.matmul(Ri, np.matmul(Rj.T, np.matmul(np.linalg.inv(Kj), np.append(point2, 1)))))
+            pijl = np.matmul(Kj, np.matmul(Rj, np.matmul(Ri.T, np.matmul(np.linalg.inv(Ki), np.append(point1, 1)))))
+
+            residual1 = point1 - pijk[:-1] / pijk[-1]
+            residual2 = point2 - pijl[:-1] / pijl[-1]
+
+            error += np.sum(residual1**2) + np.sum(residual2**2)
+
+    return error
+
+def bundle_adjust_jax(pw_inliers, matches, max_iter = 100):
+    
+    params = jaxopt.LevenbergMarquardt(jax_residual(params, pw_inliers, matches), maxiter=max_iter, verbose=True)
+
+
+        
+
+
+
 
         
         
