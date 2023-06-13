@@ -8,6 +8,21 @@ import torch.nn.functional as F
 import torch
 import scipy.optimize as opt
 
+def plot_correspondences(image1, image2, correspondences, color):
+    image = np.concatenate((image1, image2), axis=1)
+    image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+    for correspondence in correspondences:
+        point1, point2 = correspondence
+        point1 = (int(round(point1[0])), int(round(point1[1])))
+        point2 = (int(round(point2[0])), int(round(point2[1])))
+        cv2.circle(image, point1, 10, color, 2, cv2.LINE_AA)
+        cv2.circle(image, tuple([point2[0] + image1.shape[1], point2[1]]), 10, 
+                   color, 2, cv2.LINE_AA)
+        cv2.line(image, point1, tuple([point2[0] + image1.shape[1], point2[1]]), 
+                 color, 2)
+    plot = plt.imshow(image)
+    return plot
+
 def load_images(images_folder_path):
     images = []
     for filename in os.listdir(images_folder_path):
@@ -218,7 +233,6 @@ def bundle_adjust_torch(pw_inliers, matches, max_iter = 100):
 
 
 
-
 def bundle_adjust(pw_inliers, matches, max_iter = 100):
     #we assume that the camera rotates about its optical center.
     #we parameterize the homography by focal length and a rotation matrix
@@ -394,7 +408,83 @@ def bundle_adjust_jax(pw_inliers, matches, max_iter = 100):
     
     params = jaxopt.LevenbergMarquardt(jax_residual(params, pw_inliers, matches), maxiter=max_iter, verbose=True)
 
+import scipy.optimize as opt
 
+def sparsity_shape(pw_inliers, matches):
+    num_residuals = 0
+    num_params = 4*pw_inliers.shape[0]
+    for match in matches:
+        i,j = match
+        num_residuals += 4 * len(pw_inliers[i][j])
+
+    sparsity = np.zeros((num_residuals, num_params))
+    for match in matches:
+        i,j = match
+        idx = 2*i*pw_inliers.shape[0]+2*j
+        sparsity[idx:idx+4, 4*i:4*i+4] = np.ones((4,4))
+        sparsity[idx:idx+4, 4*j:4*j+4] = np.ones((4,4))
+
+    return sparsity
+
+def residual(params, pw_inliers, matches):
+    num_residuals = 0
+    error = 0
+
+    for match in matches:
+        i,j = match
+        num_residuals += 4 * len(pw_inliers[i][j])
+
+    residuals = np.zeros(num_residuals)
+    for match in matches:
+        i,j = match
+
+        fi = params[4*i]
+        fj = params[4*j]
+        ri1 = params[4*i+1]
+        ri2 = params[4*i+2]
+        ri3 = params[4*i+3]
+        rj1 = params[4*j+1]
+        rj2 = params[4*j+2]
+        rj3 = params[4*j+3]
+
+        Ki = np.array([[fi, 0, 0], [0, fi, 0], [0, 0, 1]])
+        Kj = np.array([[fj, 0, 0], [0, fj, 0], [0, 0, 1]])
+        Ri = np.array([[0, -ri3, ri2], [ri3, 0, -ri1], [-ri2, ri1, 0]])           
+        Rj = np.array([[0, -rj3, rj2], [rj3, 0, -rj1], [-rj2, rj1, 0]])
+
+        thetai = np.sqrt(ri1**2 + ri2**2 + ri3**2)
+        thetaj = np.sqrt(rj1**2 + rj2**2 + rj3**2)
+
+        Ri = np.eye(3) + np.sin(thetai)/thetai * Ri + (1-np.cos(thetai))/(thetai**2) * np.matmul(Ri, Ri)
+        Rj = np.eye(3) + np.sin(thetaj)/thetaj * Rj + (1-np.cos(thetaj))/(thetaj**2) * np.matmul(Rj, Rj)
+
+        for correspondence in pw_inliers[i][j]:
+            point1, point2 = correspondence
+
+            pijk = np.matmul(Ki, np.matmul(Ri, np.matmul(Rj.T, np.matmul(np.linalg.inv(Kj), np.append(point2, 1)))))
+            pijl = np.matmul(Kj, np.matmul(Rj, np.matmul(Ri.T, np.matmul(np.linalg.inv(Ki), np.append(point1, 1)))))
+
+            residual1 = point1 - pijk[:-1] / pijk[-1]
+            residual2 = point2 - pijl[:-1] / pijl[-1]
+
+            error += np.sum(residual1**2) + np.sum(residual2**2)
+            idx = 2*i*pw_inliers.shape[0]+2*j
+            residuals[idx] = residual1[0]
+            residuals[idx+1] = residual1[1]
+            residuals[idx+2] = residual2[0]
+            residuals[idx+3] = residual2[1]
+
+    return residuals
+
+def bundle_adjust_scipy(pw_inliers, matches, images, max_iter = 100):
+    params = np.ones(4*len(pw_inliers))
+    #initialize focal lengths, assuming pinhole camera model
+    for i in range(len(images)):
+        params[4*i] = images[i].shape[1]
+    result = opt.least_squares(residual, params, jac_sparsity = sparsity_shape(pw_inliers, matches), args=(pw_inliers, matches), verbose = 2, max_nfev = max_iter)
+    params = result.x
+
+    return params
         
 
 
